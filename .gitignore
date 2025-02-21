@@ -37,3 +37,9 @@
 *.vcxproj.filters
 *.vcxproj.user
 .vs/
+
+#build files
+x64/
+OGL-RT/
+
+.git/

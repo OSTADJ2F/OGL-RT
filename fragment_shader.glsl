@@ -1,4 +1,4 @@
-#version 330 core
+ï»¿#version 330 core
 out vec4 FragColor;
 in vec2 TexCoords;
 
@@ -10,9 +10,24 @@ uniform bool uDenoise; // Toggle for denoising
 uniform bool uGI;      // Toggle for global illumination
 uniform bool uSkybox;  // Toggle for using the skybox
 uniform sampler2D uSkyboxTex; // HDR skybox texture (equirectangular)
+uniform sampler2D uPrevFrame;
+uniform float uCameraDelta;
+uniform int uFrameCount;
+
+#define MAX_SPHERES 16  // Maximum number of spheres we'll support
+
+struct Sphere {
+    vec3 center;
+    float radius;
+    vec3 color;
+};
+
+// New uniform for sphere data
+uniform int uNumSpheres;
+uniform Sphere uSpheres[MAX_SPHERES];
 
 // Maximum number of bounces for reflections/gi
-const int maxBounces = 3;
+const int maxBounces = 5;
 
 // --------------------------------------------------------
 // 1. Sphere Intersection
@@ -22,11 +37,16 @@ float intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius, out vec3 norm
     float b = dot(oc, rd);
     float c = dot(oc, oc) - radius * radius;
     float h = b * b - c;
-    if (h < 0.0) return -1.0;
+    
+    // Increase numerical precision
+    if (abs(h) < 0.0001) return -1.0;
+    
     h = sqrt(h);
     float t = -b - h;
-    if (t < 0.0) t = -b + h;
-    if (t > 0.0) {
+    
+    // Add minimum distance threshold
+    if (t < 0.001) t = -b + h;
+    if (t > 0.001) {
         vec3 hitPos = ro + t * rd;
         normal = normalize(hitPos - center);
         return t;
@@ -36,19 +56,18 @@ float intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius, out vec3 norm
 
 // --------------------------------------------------------
 // 2. Finite Plane Intersection
-//    (plane at y=planeY, with half-size in X and Z)
 // --------------------------------------------------------
 float intersectFinitePlane(vec3 ro, vec3 rd, float planeY, float halfSize, out vec3 normal) {
-    // If the ray is nearly parallel to the plane, no intersection
-    if (abs(rd.y) < 0.0001) return -1.0;
-
-    // Solve for t in plane equation y=planeY
+    // Increased precision check for near-parallel rays
+    if (abs(rd.y) < 0.00001) return -1.0;  // Was 0.0001
+    
     float t = (planeY - ro.y) / rd.y;
-    if (t > 0.0) {
-        // Check (x,z) within halfSize
+    // Add minimum distance check to avoid near-zero intersections
+    if (t > 0.001) {  // Add minimum distance threshold
         vec3 hitPos = ro + t * rd;
+        // Reduce plane size to avoid artifacts
         if (abs(hitPos.x) <= halfSize && abs(hitPos.z) <= halfSize) {
-            normal = vec3(0.0, 1.0, 0.0);
+            normal = vec3(0.0, sign(rd.y), 0.0);  // Correct normal direction based on ray
             return t;
         }
     }
@@ -74,21 +93,21 @@ vec3 traceRay(vec3 ro, vec3 rd) {
         vec3 baseColor;
         bool hit = false;
 
-        // --- Sphere: example red sphere at (0,0,5) radius=1 ---
-        vec3 sphereCenter = vec3(0.0, 0.0, 5.0);
-        float sphereRadius = 1.0;
-        vec3 nSphere;
-        float tSphere = intersectSphere(ro, rd, sphereCenter, sphereRadius, nSphere);
-        if (tSphere > 0.0 && tSphere < t) {
-            t = tSphere;
-            hitNormal = nSphere;
-            baseColor = vec3(1.0, 0.0, 0.0); // red
-            hit = true;
+        // Replace the single sphere test with a loop through all spheres
+        for (int i = 0; i < uNumSpheres; i++) {
+            vec3 nSphere;
+            float tSphere = intersectSphere(ro, rd, uSpheres[i].center, uSpheres[i].radius, nSphere);
+            if (tSphere > 0.0 && tSphere < t) {
+                t = tSphere;
+                hitNormal = nSphere;
+                baseColor = uSpheres[i].color;
+                hit = true;
+            }
         }
 
-        // --- Finite Plane: large “floor” at y=-1, ±50 in X,Z ---
+        // --- Finite Plane: large â€œfloorâ€ at y=-1, Â±50 in X,Z ---
         float planeY = -1.0;
-        float halfSize = 50.0; // big enough to look large, but not infinite
+        float halfSize = 10.0;  // Reduced from 20.0 to create a more reasonable floor size
         vec3 nPlane;
         float tPlane = intersectFinitePlane(ro, rd, planeY, halfSize, nPlane);
         if (tPlane > 0.0 && tPlane < t) {
@@ -159,6 +178,7 @@ vec3 traceRay(vec3 ro, vec3 rd) {
         else {
             // Glossy reflection: reflect + small random perturbation
             vec3 refl = reflect(rd, hitNormal);
+            refl = normalize(refl);  // Add explicit normalization
             float roughness = 0.2;
             vec2 seed = hitPos.xz + vec2(uTime);
             float r1 = fract(sin(dot(seed, vec2(12.9898, 78.233))) * 43758.5453);
@@ -177,7 +197,7 @@ vec3 traceRay(vec3 ro, vec3 rd) {
         }
 
         // Offset ray origin to avoid self-intersection
-        ro = hitPos + hitNormal * 0.001;
+        ro = hitPos + hitNormal * 0.002;  // Increased from 0.001 to avoid self-intersection
 
         // Next bounce is further attenuated by reflectivity
         attenuation *= reflectivity;
@@ -186,8 +206,8 @@ vec3 traceRay(vec3 ro, vec3 rd) {
     // --------------------------------------------------------
     // Fog based on the total distance traveled
     // --------------------------------------------------------
-    float nearFog = 10.0;
-    float farFog = 50.0;
+    float nearFog = 8.0;   // Reduced from 10.0
+    float farFog = 40.0;   // Reduced from 50.0
     float fogFactor = clamp((totalDistance - nearFog) / (farFog - nearFog), 0.0, 1.0);
 
     // If totalDistance < nearFog, fogFactor = 0 => no fog
@@ -210,18 +230,18 @@ void main() {
     float fov = radians(45.0);
     float aspect = 1280.0 / 720.0; // match your window aspect ratio
 
-    // Build the base ray direction from UV
+    // Build the base ray direction from UV with corrected forward direction
     vec3 rayDir = normalize(uCamRot * vec3(
         uv.x * aspect * tan(fov / 2.0),
         uv.y * tan(fov / 2.0),
-        1.0
+        -1.0  // Changed from 1.0 to -1.0 to fix ray direction
     ));
 
     vec3 color;
 
     if (uDenoise) {
-        // Example: multi-sample approach
-        int samples = 80;
+        // Multi-sample approach
+        int samples = 30;
         vec3 acc = vec3(0.0);
         for (int i = 0; i < samples; i++) {
             float jitterX = (
@@ -239,7 +259,7 @@ void main() {
             vec3 rayDirOffset = normalize(uCamRot * vec3(
                 uvOffset.x * aspect * tan(fov / 2.0),
                 uvOffset.y * tan(fov / 2.0),
-                1.0
+                -1.0  // Also update the jittered ray direction
             ));
 
             acc += traceRay(uCamPos, rayDirOffset);
